@@ -275,6 +275,8 @@ pub async fn run_bot(token: &str, backend: LlmBackend) {
         teloxide::types::BotCommand::new("availabletools", "List all available tools"),
         teloxide::types::BotCommand::new("allowedtools", "Show currently allowed tools"),
         teloxide::types::BotCommand::new("allowed", "Add/remove tool (+name / -name)"),
+        teloxide::types::BotCommand::new("claude", "Switch to Claude Code"),
+        teloxide::types::BotCommand::new("codex", "Switch to OpenAI Codex"),
     ];
     if let Err(e) = bot.set_my_commands(commands).await {
         println!("  ⚠ Failed to set bot commands: {e}");
@@ -517,6 +519,23 @@ async fn handle_message(
     } else if text.starts_with("/allowed") {
         println!("  [{timestamp}] ◀ [{user_name}] /allowed {}", text.strip_prefix("/allowed").unwrap_or("").trim());
         handle_allowed_command(&bot, chat_id, &text, &state, token).await?;
+    } else if text == "/claude" || text == "/codex" {
+        let new_backend = if text == "/codex" { LlmBackend::Codex } else { LlmBackend::Claude };
+        let backend_name = if text == "/codex" { "OpenAI Codex" } else { "Claude Code" };
+        println!("  [{timestamp}] ◀ [{user_name}] {text}");
+        {
+            let mut data = state.lock().await;
+            data.backend = new_backend;
+            // Clear session_id so the new backend starts fresh
+            if let Some(session) = data.sessions.get_mut(&chat_id) {
+                session.session_id = None;
+            }
+        }
+        shared_rate_limit_wait(&state, chat_id).await;
+        bot.send_message(chat_id, format!("Switched to <b>{}</b>", backend_name))
+            .parse_mode(ParseMode::Html)
+            .await?;
+        println!("  [{timestamp}] ▶ [{user_name}] Backend → {backend_name}");
     } else if text.starts_with('!') {
         println!("  [{timestamp}] ◀ [{user_name}] Shell: {preview}");
         handle_shell_command(&bot, chat_id, &text, &state).await?;
@@ -563,8 +582,9 @@ Send a file/photo — Upload to session directory
   e.g. <code>!ls -la</code>, <code>!git status</code>
 
 <b>AI Chat</b>
-Any other message is sent to Claude AI.
-AI can read, edit, and run commands in your session.
+Any other message is sent to the active AI backend.
+<code>/claude</code> — Switch to Claude Code
+<code>/codex</code> — Switch to OpenAI Codex
 
 <b>Tool Management</b>
 <code>/availabletools</code> — List all available tools
