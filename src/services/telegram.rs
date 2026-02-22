@@ -1406,7 +1406,7 @@ async fn handle_text_message(
                     &current_path_clone,
                     tx.clone(),
                     Some(&system_prompt_owned),
-                    None, // use default model
+                    Some("gpt-5.3-codex"), // latest codex model
                     Some(cancel_token_clone),
                 )
             }
