@@ -31,3 +31,10 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Server runtime data (sensitive)
+bot_settings.json
+ai_sessions/
+workspace/
+run.sh
+*.service
