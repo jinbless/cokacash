@@ -40,7 +40,8 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s)");
+    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s) (Claude Code backend)");
+    println!("    --codex                 Use OpenAI Codex as the LLM backend (with --ccserver)");
     println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
     println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
     println!();
@@ -98,8 +99,12 @@ fn print_version() {
     println!("cokacdir {}", VERSION);
 }
 
-fn handle_ccserver(tokens: Vec<String>) {
+fn handle_ccserver(tokens: Vec<String>, use_codex: bool) {
+    use crate::services::telegram::LlmBackend;
+
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    let backend = LlmBackend::from_flag(use_codex);
+    let backend_label = if use_codex { "OpenAI Codex" } else { "Claude Code" };
 
     let title = format!("  cokacdir v{}  |  Telegram Bot Server  ", VERSION);
     let width = title.chars().count();
@@ -107,13 +112,14 @@ fn handle_ccserver(tokens: Vec<String>) {
     println!("  ┌{}┐", "─".repeat(width));
     println!("  │{}│", title);
     println!("  └{}┘", "─".repeat(width));
+    println!("  ▸ LLM Backend  : {}", backend_label);
     println!();
 
     if tokens.len() == 1 {
         println!("  ▸ Bot instance : 1");
         println!("  ▸ Status       : Connecting...");
         println!();
-        rt.block_on(services::telegram::run_bot(&tokens[0]));
+        rt.block_on(services::telegram::run_bot(&tokens[0], backend));
     } else {
         println!("  ▸ Bot instances : {}", tokens.len());
         println!("  ▸ Status        : Connecting...");
@@ -123,7 +129,7 @@ fn handle_ccserver(tokens: Vec<String>) {
             for (i, token) in tokens.into_iter().enumerate() {
                 handles.push(tokio::spawn(async move {
                     println!("  ✓ Bot #{} connected", i + 1);
-                    services::telegram::run_bot(&token).await;
+                    services::telegram::run_bot(&token, backend).await;
                 }));
             }
             for handle in handles {
@@ -239,16 +245,18 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--ccserver" => {
-                let tokens: Vec<String> = args[i + 1..].iter()
+                let remaining = &args[i + 1..];
+                let use_codex = remaining.iter().any(|a| a == "--codex");
+                let tokens: Vec<String> = remaining.iter()
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
                 if tokens.is_empty() {
                     eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
+                    eprintln!("Usage: cokacdir --ccserver [--codex] <TOKEN> [TOKEN2] ...");
                     return Ok(());
                 }
-                handle_ccserver(tokens);
+                handle_ccserver(tokens, use_codex);
                 return Ok(());
             }
             "--sendfile" => {

@@ -11,7 +11,21 @@ use teloxide::types::ParseMode;
 use sha2::{Sha256, Digest};
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::codex;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
+
+/// LLM backend selection
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LlmBackend {
+    Claude,
+    Codex,
+}
+
+impl LlmBackend {
+    pub fn from_flag(use_codex: bool) -> Self {
+        if use_codex { LlmBackend::Codex } else { LlmBackend::Claude }
+    }
+}
 
 /// Per-chat session state
 struct ChatSession {
@@ -67,6 +81,8 @@ struct SharedData {
     stop_message_ids: HashMap<ChatId, teloxide::types::MessageId>,
     /// Per-chat timestamp of the last Telegram API call (for rate limiting)
     api_timestamps: HashMap<ChatId, tokio::time::Instant>,
+    /// Active LLM backend
+    backend: LlmBackend,
 }
 
 type SharedState = Arc<Mutex<SharedData>>;
@@ -243,7 +259,7 @@ fn risk_badge(destructive: bool) -> &'static str {
 }
 
 /// Entry point: start the Telegram bot with long polling
-pub async fn run_bot(token: &str) {
+pub async fn run_bot(token: &str, backend: LlmBackend) {
     let bot = Bot::new(token);
     let bot_settings = load_bot_settings(token);
 
@@ -275,9 +291,14 @@ pub async fn run_bot(token: &str) {
         cancel_tokens: HashMap::new(),
         stop_message_ids: HashMap::new(),
         api_timestamps: HashMap::new(),
+        backend,
     }));
 
-    println!("  ✓ Bot connected — Listening for messages");
+    let backend_name = match backend {
+        LlmBackend::Claude => "Claude Code",
+        LlmBackend::Codex => "OpenAI Codex",
+    };
+    println!("  ✓ Bot connected — Listening for messages (backend: {})", backend_name);
 
     let shared_state = state.clone();
     let token_owned = token.to_string();
@@ -1331,10 +1352,11 @@ async fn handle_text_message(
 
     // Create cancel token for this request
     let cancel_token = Arc::new(CancelToken::new());
-    {
+    let active_backend = {
         let mut data = state.lock().await;
         data.cancel_tokens.insert(chat_id, cancel_token.clone());
-    }
+        data.backend
+    };
 
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
@@ -1343,17 +1365,32 @@ async fn handle_text_message(
     let current_path_clone = current_path.clone();
     let cancel_token_clone = cancel_token.clone();
 
-    // Run Claude in a blocking thread
+    // Run LLM backend in a blocking thread
     tokio::task::spawn_blocking(move || {
-        let result = claude::execute_command_streaming(
-            &context_prompt,
-            session_id_clone.as_deref(),
-            &current_path_clone,
-            tx.clone(),
-            Some(&system_prompt_owned),
-            Some(&allowed_tools),
-            Some(cancel_token_clone),
-        );
+        let result = match active_backend {
+            LlmBackend::Claude => {
+                claude::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                )
+            }
+            LlmBackend::Codex => {
+                codex::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    None, // use default model
+                    Some(cancel_token_clone),
+                )
+            }
+        };
 
         if let Err(e) = result {
             let _ = tx.send(StreamMessage::Error { message: e });
