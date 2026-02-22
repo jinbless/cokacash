@@ -101,13 +101,21 @@ pub fn execute_command_streaming(
             "Codex CLI not found. Install with: npm install -g @openai/codex".to_string()
         })?;
 
-    // Build args for: codex exec --json --full-auto --cd <dir> [--model <m>] <prompt>
+    // Ensure working directory is a git repo (Codex CLI requires it)
+    let work_dir_path = std::path::Path::new(working_dir);
+    if !work_dir_path.join(".git").exists() {
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(working_dir)
+            .output();
+        debug_log(&format!("Initialized git repo in {}", working_dir));
+    }
+
+    // Build args for: codex exec --json --full-auto [--model <m>] <prompt>
     let mut args: Vec<String> = vec![
         "exec".to_string(),
         "--json".to_string(),
         "--full-auto".to_string(),
-        "--cd".to_string(),
-        working_dir.to_string(),
     ];
 
     // Model selection
@@ -141,13 +149,22 @@ pub fn execute_command_streaming(
     debug_log(&format!("Command: {} {}", codex_bin, args.join(" ")));
 
     let spawn_start = std::time::Instant::now();
-    let mut child = Command::new(codex_bin)
-        .args(&args)
+    let mut cmd = Command::new(codex_bin);
+    cmd.args(&args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+
+    // Explicitly pass OPENAI_API_KEY from environment
+    if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        cmd.env("OPENAI_API_KEY", &api_key);
+        debug_log(&format!("OPENAI_API_KEY set ({}... chars)", api_key.len()));
+    } else {
+        debug_log("WARNING: OPENAI_API_KEY not set!");
+    }
+
+    let mut child = cmd.spawn()
         .map_err(|e| {
             debug_log(&format!("ERROR: Failed to spawn: {}", e));
             format!("Failed to start Codex: {}. Is Codex CLI installed?", e)
@@ -217,6 +234,17 @@ pub fn execute_command_streaming(
         }
     }
 
+    // Read stderr for error details
+    let stderr_output = child.stderr.take()
+        .map(|stderr| {
+            let reader = BufReader::new(stderr);
+            reader.lines()
+                .filter_map(|l| l.ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
     // Wait for process
     let status = child.wait().map_err(|e| format!("Process error: {}", e))?;
 
@@ -229,8 +257,13 @@ pub fn execute_command_streaming(
     }
 
     if !status.success() {
-        debug_log(&format!("Process failed with code {:?}", status.code()));
-        return Err(format!("Process exited with code {:?}", status.code()));
+        let err_msg = if stderr_output.is_empty() {
+            format!("Process exited with code {:?}", status.code())
+        } else {
+            format!("Codex error: {}", stderr_output.chars().take(500).collect::<String>())
+        };
+        debug_log(&format!("Process failed: {}", err_msg));
+        return Err(err_msg);
     }
 
     debug_log("=== codex execute_command_streaming END (success) ===");
