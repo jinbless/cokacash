@@ -3112,9 +3112,14 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
 }
 
 /// Claude: find `~/.claude/projects/*/{session_id}.jsonl`.
+/// Respects CLAUDE_CONFIG_DIR environment variable for custom config locations.
 fn resolve_claude_by_id(session_id: &str) -> Option<ResolvedSession> {
     msg_debug(&format!("[resolve_claude_by_id] session_id={}", session_id));
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let claude_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+    let projects_dir = claude_dir.join("projects");
     if !projects_dir.is_dir() {
         msg_debug(&format!("[resolve_claude_by_id] projects_dir not found: {}", projects_dir.display()));
         return None;
@@ -3138,9 +3143,14 @@ fn resolve_claude_by_id(session_id: &str) -> Option<ResolvedSession> {
 }
 
 /// Claude: scan `~/.claude/projects/*/*.jsonl` for matching `custom-title`.
+/// Respects CLAUDE_CONFIG_DIR environment variable for custom config locations.
 fn resolve_claude_by_name(name: &str) -> Option<ResolvedSession> {
     msg_debug(&format!("[resolve_claude_by_name] name={:?}", name));
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let claude_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+    let projects_dir = claude_dir.join("projects");
     if !projects_dir.is_dir() {
         msg_debug(&format!("[resolve_claude_by_name] projects_dir not found: {}", projects_dir.display()));
         return None;
@@ -3358,8 +3368,13 @@ fn find_latest_session_by_cwd(canonical_path: &str, provider: SessionProvider) -
 }
 
 /// Claude: scan all `~/.claude/projects/*/*.jsonl` for the latest session matching cwd.
+/// Respects CLAUDE_CONFIG_DIR environment variable for custom config locations.
 fn find_latest_claude_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let claude_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    let projects_dir = claude_dir.map(|d| d.join("projects"))?;
     msg_debug(&format!("[find_claude_by_cwd] projects_dir={}, is_dir={}", projects_dir.display(), projects_dir.is_dir()));
     if !projects_dir.is_dir() { return None; }
     let mut best_path: Option<std::path::PathBuf> = None;

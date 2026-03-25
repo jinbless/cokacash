@@ -361,6 +361,7 @@ SECURITY RULES (MUST FOLLOW):
 - NEVER execute destructive commands like rm -rf, format, mkfs, dd, etc.
 - NEVER modify system files in /etc, /sys, /proc, /boot
 - NEVER access or modify files outside the current working directory without explicit user path
+- EXCEPTION: Reading and writing to ~/.claude/skills/, ~/.claude/commands/, ~/.claude/agents/ is ALWAYS allowed for skill/command/agent creation and management
 - NEVER execute commands that could harm the system or compromise security
 - ONLY suggest safe file operations: copy, move, rename, create directory, view, edit
 - If a request seems dangerous, explain the risk and suggest a safer alternative
@@ -827,6 +828,7 @@ SECURITY RULES (MUST FOLLOW):
 - NEVER execute destructive commands like rm -rf, format, mkfs, dd, etc.
 - NEVER modify system files in /etc, /sys, /proc, /boot
 - NEVER access or modify files outside the current working directory without explicit user path
+- EXCEPTION: Reading and writing to ~/.claude/skills/, ~/.claude/commands/, ~/.claude/agents/ is ALWAYS allowed for skill/command/agent creation and management
 - NEVER execute commands that could harm the system or compromise security
 - ONLY suggest safe file operations: copy, move, rename, create directory, view, edit
 - If a request seems dangerous, explain the risk and suggest a safer alternative
