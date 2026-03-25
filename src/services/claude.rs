@@ -885,10 +885,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Always write system prompt to file and use --append-system-prompt-file
     // to avoid OS "Argument list too long" (E2BIG) error.
-    let effective_prompt = match system_prompt {
+    let effective_prompt: Option<String> = match system_prompt {
         None => Some(default_system_prompt),
         Some("") => None,
-        Some(p) => Some(p),
+        Some(p) => Some(p.to_string()),
     };
     struct SpFileGuard(Option<std::path::PathBuf>);
     impl Drop for SpFileGuard {
@@ -901,11 +901,12 @@ IMPORTANT: Format your responses using Markdown for better readability:
         let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
         let _ = std::fs::create_dir_all(&sp_dir);
         let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
+        let sp_len = sp.len();
         std::fs::write(&sp_path, sp).map_err(|e| {
             debug_log(&format!("ERROR: Failed to write system prompt file: {}", e));
             format!("Failed to write system prompt file: {}", e)
         })?;
-        debug_log(&format!("System prompt written to {:?} ({} bytes)", sp_path, sp.len()));
+        debug_log(&format!("System prompt written to {:?} ({} bytes)", sp_path, sp_len));
         args.push("--append-system-prompt-file".to_string());
         args.push(sp_path.to_string_lossy().to_string());
         _sp_guard = SpFileGuard(Some(sp_path));
