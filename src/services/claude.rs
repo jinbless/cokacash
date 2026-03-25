@@ -355,13 +355,20 @@ pub fn execute_command(
         "json".to_string(),
     ];
 
-    let default_system_prompt = r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
+    let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".claude").to_string_lossy().into_owned())
+                .unwrap_or_else(|| "~/.claude".to_string())
+        });
+    let default_system_prompt = format!(
+        r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
 
 SECURITY RULES (MUST FOLLOW):
 - NEVER execute destructive commands like rm -rf, format, mkfs, dd, etc.
 - NEVER modify system files in /etc, /sys, /proc, /boot
 - NEVER access or modify files outside the current working directory without explicit user path
-- EXCEPTION: Reading and writing to ~/.claude/skills/, ~/.claude/commands/, ~/.claude/agents/ is ALWAYS allowed for skill/command/agent creation and management
+- EXCEPTION: Reading and writing to {0}/skills/, {0}/commands/, {0}/agents/ is ALWAYS allowed for skill/command/agent creation and management
 - NEVER execute commands that could harm the system or compromise security
 - ONLY suggest safe file operations: copy, move, rename, create directory, view, edit
 - If a request seems dangerous, explain the risk and suggest a safer alternative
@@ -382,7 +389,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use numbered lists (1. item) for sequential steps
 - Use code blocks (```language) for multi-line code or command examples
 - Use headers (## Title) to organize longer responses
-- Keep formatting minimal and terminal-friendly"#;
+- Keep formatting minimal and terminal-friendly"#,
+        claude_config_dir
+    );
 
     // Write system prompt to file to avoid OS "Argument list too long" (E2BIG)
     struct SpFileGuard(Option<std::path::PathBuf>);
@@ -822,13 +831,20 @@ pub fn execute_command_streaming(
     debug_log(&format!("working_dir: {}", working_dir));
     debug_log(&format!("timestamp: {:?}", std::time::SystemTime::now()));
 
-    let default_system_prompt = r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
+    let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".claude").to_string_lossy().into_owned())
+                .unwrap_or_else(|| "~/.claude".to_string())
+        });
+    let default_system_prompt = format!(
+        r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
 
 SECURITY RULES (MUST FOLLOW):
 - NEVER execute destructive commands like rm -rf, format, mkfs, dd, etc.
 - NEVER modify system files in /etc, /sys, /proc, /boot
 - NEVER access or modify files outside the current working directory without explicit user path
-- EXCEPTION: Reading and writing to ~/.claude/skills/, ~/.claude/commands/, ~/.claude/agents/ is ALWAYS allowed for skill/command/agent creation and management
+- EXCEPTION: Reading and writing to {0}/skills/, {0}/commands/, {0}/agents/ is ALWAYS allowed for skill/command/agent creation and management
 - NEVER execute commands that could harm the system or compromise security
 - ONLY suggest safe file operations: copy, move, rename, create directory, view, edit
 - If a request seems dangerous, explain the risk and suggest a safer alternative
@@ -849,7 +865,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use numbered lists (1. item) for sequential steps
 - Use code blocks (```language) for multi-line code or command examples
 - Use headers (## Title) to organize longer responses
-- Keep formatting minimal and terminal-friendly"#;
+- Keep formatting minimal and terminal-friendly"#,
+        claude_config_dir
+    );
 
     let tools_str = match allowed_tools {
         Some(tools) => tools.join(","),
