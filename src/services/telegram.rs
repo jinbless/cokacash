@@ -2535,6 +2535,11 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /instruction");
         println!("  [{timestamp}] ◀ [{user_name}] /instruction");
         handle_instruction_command(&bot, chat_id, &text, &state, token).await?;
+    } else if text.starts_with("/switchaccount") {
+        msg_debug("[handle_message] routing → /switchaccount");
+        let sa_arg = text.strip_prefix("/switchaccount").unwrap_or("").trim();
+        println!("  [{timestamp}] ◀ [{user_name}] /switchaccount {}", sa_arg);
+        handle_switchaccount_command(&bot, chat_id, &text, &state).await?;
     } else if text.starts_with("/allowed") {
         msg_debug("[handle_message] routing → /allowed");
         println!("  [{timestamp}] ◀ [{user_name}] /allowed {}", text.strip_prefix("/allowed").unwrap_or("").trim());
@@ -5361,6 +5366,80 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
     } else {
         Err("")  // invalid format
     }
+}
+
+/// Handle /switchaccount command — switch Claude account (CLAUDE_CONFIG_DIR) at runtime
+async fn handle_switchaccount_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+) -> ResponseResult<()> {
+    let arg = text.strip_prefix("/switchaccount").unwrap_or("").trim();
+    msg_debug(&format!("[handle_switchaccount] chat_id={}, arg={:?}", chat_id.0, arg));
+
+    // No argument: show current CLAUDE_CONFIG_DIR
+    if arg.is_empty() {
+        let current = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| "(default ~/.claude)".to_string());
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, format!("Current account: `{}`", current))
+            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+            .await)?;
+        return Ok(());
+    }
+
+    // Resolve account path: try CLAUDE_ACCOUNT_{ARG} env var, then treat as direct path
+    let new_path = if let Ok(p) = std::env::var(format!("CLAUDE_ACCOUNT_{}", arg.to_uppercase())) {
+        p
+    } else {
+        // Try as direct path (expand ~)
+        let expanded = if arg.starts_with("~/") || arg == "~" {
+            if let Some(home) = dirs::home_dir() {
+                home.join(arg.strip_prefix("~/").unwrap_or("")).display().to_string()
+            } else {
+                arg.to_string()
+            }
+        } else {
+            arg.to_string()
+        };
+        expanded
+    };
+
+    // Validate path exists
+    if !std::path::Path::new(&new_path).is_dir() {
+        let env_key = format!("CLAUDE_ACCOUNT_{}", arg.to_uppercase());
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, format!(
+            "Error: env `{}` not set and path `{}` not found.", env_key, new_path
+        )).await)?;
+        return Ok(());
+    }
+
+    let old_path = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| "(default)".to_string());
+
+    // Switch CLAUDE_CONFIG_DIR
+    std::env::set_var("CLAUDE_CONFIG_DIR", &new_path);
+    msg_debug(&format!("[handle_switchaccount] switched: {} → {}", old_path, new_path));
+
+    // Reset all sessions: clear session_id and history, but keep current_path (cwd)
+    {
+        let mut data = state.lock().await;
+        let mut reset_count = 0;
+        for (_cid, session) in data.sessions.iter_mut() {
+            session.session_id = None;
+            session.history.clear();
+            reset_count += 1;
+        }
+        msg_debug(&format!("[handle_switchaccount] reset {} sessions", reset_count));
+    }
+
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, format!(
+        "✅ Account switched: `{}` → `{}`\nAll sessions reset. Working directories preserved.",
+        old_path, new_path
+    )).await)?;
+
+    Ok(())
 }
 
 /// Handle /model command
