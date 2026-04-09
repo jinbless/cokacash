@@ -6007,6 +6007,11 @@ async fn handle_text_message(
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
+        // Plan mode dedup: remember where the current plan block starts inside
+        // full_response so that if Claude emits more than one ExitPlanMode in a
+        // single stream (it sometimes replays past plans from session memory),
+        // we truncate the previous plan block and keep only the latest one.
+        let mut plan_block_start: Option<usize> = None;
         let is_group_chat = chat_id.0 < 0;
         let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
@@ -6048,7 +6053,14 @@ async fn handle_text_message(
                                     msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
                                         content.len(), truncate_str(&content, 80)));
                                     raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: content.clone() });
-                                    full_response.push_str(&content);
+                                    // In plan mode, once a plan has been captured via ExitPlanMode,
+                                    // suppress any further narration text — Claude often trails with
+                                    // "승인해 주시면..." which would land after the /yes /no footer.
+                                    if plan_mode_for_poll && plan_block_start.is_some() {
+                                        msg_debug("[polling] plan mode: suppressing post-plan text");
+                                    } else {
+                                        full_response.push_str(&content);
+                                    }
                                 }
                                 StreamMessage::ToolUse { name, input } => {
                                     // Intercept ExitPlanMode: Claude finished planning in --permission-mode plan.
@@ -6071,9 +6083,21 @@ async fn handle_text_message(
                                                 });
                                             }
                                             raw_entries.push(RawPayloadEntry { tag: "Plan".into(), content: plan_text.clone() });
+                                            // Dedup: if a plan block was already appended earlier in this
+                                            // stream, truncate full_response back to that start index and
+                                            // re-render only the latest plan. This prevents Claude's
+                                            // session-memory replays from stacking multiple plans in the UI.
+                                            if let Some(start) = plan_block_start {
+                                                msg_debug(&format!("[polling] ExitPlanMode dedup: truncating previous plan block at {} (was len={})",
+                                                    start, full_response.len()));
+                                                full_response.truncate(start);
+                                            }
                                             if !full_response.is_empty() && !full_response.ends_with('\n') {
                                                 full_response.push_str("\n\n");
                                             }
+                                            // Record the start of this plan block so a subsequent
+                                            // ExitPlanMode in the same stream can replace it.
+                                            plan_block_start = Some(full_response.len());
                                             full_response.push_str("📋 **계획 수립 완료 / Plan ready**\n\n");
                                             full_response.push_str(&plan_text);
                                             full_response.push_str("\n\n———\n✅ 실행: `/yes`    ❌ 취소: `/no`");
