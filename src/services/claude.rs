@@ -820,6 +820,7 @@ pub fn execute_command_streaming(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,
     no_session_persistence: bool,
+    plan_mode: bool,
 ) -> Result<(), String> {
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
@@ -873,15 +874,33 @@ IMPORTANT: Format your responses using Markdown for better readability:
         Some(tools) => tools.join(","),
         None => DEFAULT_ALLOWED_TOOLS.join(","),
     };
-    let mut args = vec![
-        "-p".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "--tools".to_string(),
-        tools_str,
-        "--verbose".to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-    ];
+    // In plan mode, replace --dangerously-skip-permissions with --permission-mode plan
+    // so Claude produces a plan (via ExitPlanMode tool_use) without executing anything.
+    // NOTE: --dangerously-skip-permissions takes priority over --permission-mode, so it must
+    // be omitted entirely when plan mode is requested.
+    let mut args = if plan_mode {
+        debug_log("plan_mode=true: using --permission-mode plan");
+        vec![
+            "-p".to_string(),
+            "--permission-mode".to_string(),
+            "plan".to_string(),
+            "--tools".to_string(),
+            tools_str,
+            "--verbose".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ]
+    } else {
+        vec![
+            "-p".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--tools".to_string(),
+            tools_str,
+            "--verbose".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ]
+    };
 
     // Always write system prompt to file and use --append-system-prompt-file
     // to avoid OS "Argument list too long" (E2BIG) error.

@@ -910,6 +910,7 @@ Keep responses concise and terminal-friendly.",
                 None,
                 None,
                 false,
+                false,
             );
 
             let elapsed = start_time.elapsed();

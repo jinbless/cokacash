@@ -382,6 +382,8 @@ struct BotSettings {
     context: HashMap<String, usize>,
     /// chat_id (string) → system instruction for AI
     instructions: HashMap<String, String>,
+    /// chat_id (string) → true if plan mode enabled (Claude produces plan + awaits /yes)
+    plan_mode: HashMap<String, bool>,
     /// Bot's Telegram username (stored at startup via get_me)
     username: String,
     /// Bot's display name (first_name from Telegram API, stored at startup via get_me)
@@ -401,6 +403,7 @@ impl Default for BotSettings {
             direct: HashMap::new(),
             context: HashMap::new(),
             instructions: HashMap::new(),
+            plan_mode: HashMap::new(),
             username: String::new(),
             display_name: String::new(),
         }
@@ -432,6 +435,24 @@ fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
 /// Check if silent mode is enabled for a chat (default: ON)
 fn is_silent(settings: &BotSettings, chat_id: ChatId) -> bool {
     settings.silent.get(&chat_id.0.to_string()).copied().unwrap_or(true)
+}
+
+/// Check if plan mode is enabled for a chat (default: OFF).
+/// When enabled, claude is invoked with `--permission-mode plan` so it produces
+/// a plan via the ExitPlanMode tool_use instead of executing actions. The user
+/// must then confirm with `/yes` to actually run the plan, or `/no` to cancel.
+fn is_plan_mode(settings: &BotSettings, chat_id: ChatId) -> bool {
+    settings.plan_mode.get(&chat_id.0.to_string()).copied().unwrap_or(false)
+}
+
+/// Stored plan awaiting user approval (produced by ExitPlanMode tool_use).
+#[derive(Clone)]
+struct PendingPlan {
+    /// The plan markdown text extracted from ExitPlanMode.input.plan
+    plan_text: String,
+    /// When the plan was generated (for optional TTL display; not auto-expired)
+    #[allow(dead_code)]
+    created_at: std::time::Instant,
 }
 
 /// Schedule entry persisted as JSON in ~/.cokacdir/schedule/
@@ -1432,6 +1453,11 @@ struct SharedData {
     polling_time_ms: u64,
     /// Schedule IDs currently being executed or pending, per chat
     pending_schedules: HashMap<ChatId, std::collections::HashSet<String>>,
+    /// Pending plans awaiting user approval (produced by ExitPlanMode during plan mode)
+    pending_plans: HashMap<ChatId, PendingPlan>,
+    /// Chats for which the next handle_text_message call should disable plan mode
+    /// (set by /yes approval so the follow-up call actually executes the plan)
+    force_disable_plan_next: std::collections::HashSet<ChatId>,
     /// Bot's Telegram username (for bot-to-bot messaging)
     bot_username: String,
     /// Bot's display name (first_name from Telegram API)
@@ -1641,6 +1667,13 @@ fn load_bot_settings(token: &str) -> BotSettings {
             .collect())
         .unwrap_or_default();
 
+    let plan_mode: HashMap<String, bool> = entry.get("plan_mode")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter()
+            .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+            .collect())
+        .unwrap_or_default();
+
     let username = entry.get("username")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -1651,7 +1684,7 @@ fn load_bot_settings(token: &str) -> BotSettings {
         .unwrap_or("")
         .to_string();
 
-    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, username, display_name }
+    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, plan_mode, username, display_name }
 }
 
 /// Save bot settings to bot_settings.json
@@ -1689,6 +1722,7 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "direct": settings.direct,
         "context": settings.context,
         "instructions": settings.instructions,
+        "plan_mode": settings.plan_mode,
         "username": settings.username,
         "display_name": settings.display_name,
     });
@@ -1944,6 +1978,8 @@ pub async fn run_bot(token: &str) {
         api_timestamps: HashMap::new(),
         polling_time_ms,
         pending_schedules: HashMap::new(),
+        pending_plans: HashMap::new(),
+        force_disable_plan_next: std::collections::HashSet::new(),
         bot_username: bot_username.clone(),
         bot_display_name: bot_display_name.clone(),
     }));
@@ -2527,6 +2563,19 @@ async fn handle_message(
             println!("  [{timestamp}] ◀ [{user_name}] {body}");
             handle_text_message(&bot, chat_id, body, &state, &user_name).await?;
         }
+    } else if text.starts_with("/plan") {
+        msg_debug("[handle_message] routing → /plan");
+        let plan_arg = text.strip_prefix("/plan").unwrap_or("").trim();
+        println!("  [{timestamp}] ◀ [{user_name}] /plan {}", plan_arg);
+        handle_plan_command(&bot, chat_id, &text, &state, token).await?;
+    } else if text.trim() == "/yes" || text.trim() == "/run" {
+        msg_debug("[handle_message] routing → /yes (plan approval)");
+        println!("  [{timestamp}] ◀ [{user_name}] /yes");
+        handle_plan_yes_command(&bot, chat_id, &state, &user_name).await?;
+    } else if text.trim() == "/no" || text.trim() == "/cancel" {
+        msg_debug("[handle_message] routing → /no (plan cancel)");
+        println!("  [{timestamp}] ◀ [{user_name}] /no");
+        handle_plan_no_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/instruction_clear") {
         msg_debug("[handle_message] routing → /instruction_clear");
         println!("  [{timestamp}] ◀ [{user_name}] /instruction_clear");
@@ -5173,6 +5222,107 @@ async fn handle_silent_command(
     Ok(())
 }
 
+/// Handle /plan command.
+/// Usage:
+///   /plan        — toggle plan mode on/off
+///   /plan on     — enable
+///   /plan off    — disable
+///   /plan status — show current state
+///
+/// When plan mode is ON, every normal message to this chat is sent to Claude
+/// with `--permission-mode plan`. Claude produces a plan (via ExitPlanMode
+/// tool_use) without executing any file-modifying tools. The plan is shown in
+/// chat with instructions to reply `/yes` to execute or `/no` to cancel.
+async fn handle_plan_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    let arg = text.strip_prefix("/plan").unwrap_or("").trim().to_lowercase();
+    let next = {
+        let mut data = state.lock().await;
+        let key = chat_id.0.to_string();
+        let prev = data.settings.plan_mode.get(&key).copied().unwrap_or(false);
+        let next = match arg.as_str() {
+            "on" | "true" | "1" | "enable" => true,
+            "off" | "false" | "0" | "disable" => false,
+            "status" | "" if arg == "status" => prev,
+            "" => !prev, // toggle
+            _ => !prev,
+        };
+        if arg != "status" {
+            data.settings.plan_mode.insert(key, next);
+            save_bot_settings(token, &data.settings);
+        }
+        next
+    };
+    let msg = if next {
+        "📋 Plan mode: ON\n\nClaude will produce a plan first. Reply /yes to execute or /no to cancel."
+    } else {
+        "⚡ Plan mode: OFF\n\nClaude will execute actions immediately (default behavior)."
+    };
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, msg).await)?;
+    Ok(())
+}
+
+/// Handle /yes (approve pending plan).
+/// Consumes the stored PendingPlan and re-invokes handle_text_message with an
+/// approval prompt. The `force_disable_plan_next` set marks this chat so the
+/// follow-up call runs without plan mode, actually executing the planned work.
+async fn handle_plan_yes_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    user_name: &str,
+) -> ResponseResult<()> {
+    let pending = {
+        let mut data = state.lock().await;
+        data.pending_plans.remove(&chat_id)
+    };
+    let Some(plan) = pending else {
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, "No pending plan to approve. Send a message with /plan on first.").await)?;
+        return Ok(());
+    };
+    {
+        let mut data = state.lock().await;
+        data.force_disable_plan_next.insert(chat_id);
+    }
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, "✅ Approved — executing the plan now...").await)?;
+    // Build an approval prompt that references the plan so Claude (resuming the
+    // same session) knows what to execute. The original session already contains
+    // the conversation, but we re-state the plan to be explicit.
+    let approval_prompt = format!(
+        "위 계획대로 진행해줘. 재확인을 위해 계획을 다시 붙여둠:\n\n{}",
+        plan.plan_text
+    );
+    handle_text_message(bot, chat_id, &approval_prompt, state, user_name).await
+}
+
+/// Handle /no (cancel pending plan).
+async fn handle_plan_no_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+) -> ResponseResult<()> {
+    let had = {
+        let mut data = state.lock().await;
+        data.pending_plans.remove(&chat_id).is_some()
+    };
+    let msg = if had {
+        "❌ Plan cancelled."
+    } else {
+        "No pending plan to cancel."
+    };
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, msg).await)?;
+    Ok(())
+}
+
 /// Handle /allowed command - add/remove tools
 /// Usage: /allowed +toolname  (add)
 ///        /allowed -toolname  (remove)
@@ -5596,9 +5746,17 @@ async fn handle_text_message(
         return Ok(());
     }
 
-    // Get session info, allowed tools, model, pending uploads, history, instruction, and bot_username (drop lock before any await)
-    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt) = {
+    // Get session info, allowed tools, model, pending uploads, history, instruction, bot_username, and plan_mode (drop lock before any await)
+    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, plan_mode_flag) = {
         let mut data = state.lock().await;
+        // Determine plan mode for this call:
+        // - Normally uses per-chat setting BotSettings.plan_mode
+        // - If force_disable_plan_next contains this chat (set by /yes approval), consume it and disable plan mode once
+        let mut pm = is_plan_mode(&data.settings, chat_id);
+        if data.force_disable_plan_next.remove(&chat_id) {
+            msg_debug("[handle_text_message] force_disable_plan_next consumed → plan_mode=false for this call");
+            pm = false;
+        }
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
                 (session.session_id.clone(), session.current_path.clone().unwrap_or_default())
@@ -5619,7 +5777,7 @@ async fn handle_text_message(
         let bdname = data.bot_display_name.clone();
         msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
             info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
-        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname)
+        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, pm)
     };
 
     let (session_id, current_path) = match session_info {
@@ -5797,6 +5955,7 @@ async fn handle_text_message(
                 Some(cancel_token_clone),
                 claude_model,
                 false,
+                plan_mode_flag,
             )
         };
 
@@ -5880,6 +6039,43 @@ async fn handle_text_message(
                                     full_response.push_str(&content);
                                 }
                                 StreamMessage::ToolUse { name, input } => {
+                                    // Intercept ExitPlanMode: Claude finished planning in --permission-mode plan.
+                                    // Extract the plan markdown from input.plan, store as PendingPlan, and
+                                    // append an approval prompt to the response. The Claude CLI will also
+                                    // emit a ToolResult with is_error=true / content="Exit plan mode?" which
+                                    // we suppress via suppress_tool_display to avoid showing it as an error.
+                                    if name == "ExitPlanMode" {
+                                        msg_debug("[polling] ExitPlanMode detected — extracting plan");
+                                        let plan_text = serde_json::from_str::<serde_json::Value>(&input)
+                                            .ok()
+                                            .and_then(|v| v.get("plan").and_then(|p| p.as_str()).map(String::from))
+                                            .unwrap_or_default();
+                                        if !plan_text.is_empty() {
+                                            {
+                                                let mut data = state_owned.lock().await;
+                                                data.pending_plans.insert(chat_id, PendingPlan {
+                                                    plan_text: plan_text.clone(),
+                                                    created_at: std::time::Instant::now(),
+                                                });
+                                            }
+                                            raw_entries.push(RawPayloadEntry { tag: "Plan".into(), content: plan_text.clone() });
+                                            if !full_response.is_empty() && !full_response.ends_with('\n') {
+                                                full_response.push_str("\n\n");
+                                            }
+                                            full_response.push_str("📋 **계획 수립 완료 / Plan ready**\n\n");
+                                            full_response.push_str(&plan_text);
+                                            full_response.push_str("\n\n———\n✅ 실행: `/yes`    ❌ 취소: `/no`");
+                                        } else {
+                                            msg_debug("[polling] ExitPlanMode: plan field was empty");
+                                        }
+                                        last_tool_name = name.clone();
+                                        // Suppress the synthetic "Exit plan mode?" error ToolResult
+                                        // that follows (Claude CLI rejects ExitPlanMode with an error).
+                                        suppress_tool_display = true;
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        println!("  [{ts}]   📋 ExitPlanMode (plan captured, awaiting /yes)");
+                                        continue;
+                                    }
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
                                     suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
@@ -5907,6 +6103,14 @@ async fn handle_text_message(
                                     msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                     if is_error {
                                         msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
+                                    }
+                                    // Suppress the synthetic "Exit plan mode?" error that follows the
+                                    // ExitPlanMode tool_use — it is not a real error and the plan has
+                                    // already been captured into pending_plans.
+                                    if last_tool_name == "ExitPlanMode" {
+                                        msg_debug("[polling] Suppressing ExitPlanMode ToolResult");
+                                        raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("ExitPlanMode (suppressed) is_error={}, content={}", is_error, content) });
+                                        continue;
                                     }
                                     raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("is_error={}, content={}", is_error, content) });
                                     if std::mem::take(&mut pending_cokacdir) {
@@ -7726,6 +7930,7 @@ async fn execute_schedule(
                 Some(cancel_token_clone),
                 claude_model,
                 false,
+                false,
             )
         };
         if let Err(e) = result {
@@ -8494,6 +8699,7 @@ async fn process_bot_message(
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
                 claude_model,
+                false,
                 false,
             )
         };
