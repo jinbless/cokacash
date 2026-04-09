@@ -5977,6 +5977,7 @@ async fn handle_text_message(
     let bot_display_name_for_log = bot_display_name_for_prompt.clone();
     let user_display_name_owned = user_display_name.to_string();
     let provider_str: &'static str = detect_provider(model.as_deref());
+    let plan_mode_for_poll = plan_mode_flag;
     tokio::spawn(async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
@@ -6164,6 +6165,29 @@ async fn handle_text_message(
                                     }
                                     if let Some(s) = sid {
                                         new_session_id = Some(s);
+                                    }
+                                    // Plan mode fallback: if Claude finished without calling ExitPlanMode,
+                                    // treat the accumulated text as the plan so the user can still /yes it.
+                                    if plan_mode_for_poll {
+                                        let has_plan = {
+                                            let data = state_owned.lock().await;
+                                            data.pending_plans.contains_key(&chat_id)
+                                        };
+                                        if !has_plan && !full_response.trim().is_empty() {
+                                            msg_debug("[polling] plan_mode fallback: no ExitPlanMode captured — storing full_response as pending plan");
+                                            let plan_text = full_response.clone();
+                                            {
+                                                let mut data = state_owned.lock().await;
+                                                data.pending_plans.insert(chat_id, PendingPlan {
+                                                    plan_text,
+                                                    created_at: std::time::Instant::now(),
+                                                });
+                                            }
+                                            if !full_response.ends_with('\n') {
+                                                full_response.push('\n');
+                                            }
+                                            full_response.push_str("\n———\n📋 (plan mode) ✅ 실행: `/yes`    ❌ 취소: `/no`");
+                                        }
                                     }
                                     done = true;
                                 }

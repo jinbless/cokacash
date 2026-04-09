@@ -870,10 +870,18 @@ IMPORTANT: Format your responses using Markdown for better readability:
         claude_config_dir
     );
 
-    let tools_str = match allowed_tools {
-        Some(tools) => tools.join(","),
-        None => DEFAULT_ALLOWED_TOOLS.join(","),
+    let mut tools_list: Vec<String> = match allowed_tools {
+        Some(tools) => tools.to_vec(),
+        None => DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect(),
     };
+    // In plan mode we MUST ensure ExitPlanMode is in the allowed tools list — otherwise
+    // Claude cannot signal "plan ready" via tool_use and falls back to plain text
+    // ("please approve..."), which the bot has no reliable way to capture as a plan.
+    if plan_mode && !tools_list.iter().any(|t| t == "ExitPlanMode") {
+        tools_list.push("ExitPlanMode".to_string());
+        debug_log("plan_mode=true: injected ExitPlanMode into allowed tools");
+    }
+    let tools_str = tools_list.join(",");
     // In plan mode, replace --dangerously-skip-permissions with --permission-mode plan
     // so Claude produces a plan (via ExitPlanMode tool_use) without executing anything.
     // NOTE: --dangerously-skip-permissions takes priority over --permission-mode, so it must
@@ -904,10 +912,27 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Always write system prompt to file and use --append-system-prompt-file
     // to avoid OS "Argument list too long" (E2BIG) error.
-    let effective_prompt: Option<String> = match system_prompt {
+    let base_prompt: Option<String> = match system_prompt {
         None => Some(default_system_prompt),
         Some("") => None,
         Some(p) => Some(p.to_string()),
+    };
+    // In plan mode, append a directive forcing Claude to always emit plans via the
+    // ExitPlanMode tool. Without this, Claude often responds in plain text
+    // ("please approve..."), which the bot cannot reliably capture.
+    let effective_prompt: Option<String> = if plan_mode {
+        let plan_directive = "\n\nPLAN MODE DIRECTIVE (MUST FOLLOW):\n\
+            - You are operating in plan mode (permission-mode=plan).\n\
+            - You MUST respond by calling the ExitPlanMode tool with your full plan in the `plan` field as markdown.\n\
+            - Do NOT reply with plain text saying 'I will do X' or 'please approve' — the user's bot can only capture plans submitted through ExitPlanMode.\n\
+            - Even for trivial tasks, call ExitPlanMode with a one-line plan.\n\
+            - Do not try to execute Write/Edit/Bash on the user's working directory — permission mode will block them anyway.";
+        match base_prompt {
+            Some(mut p) => { p.push_str(plan_directive); Some(p) }
+            None => Some(plan_directive.trim_start().to_string()),
+        }
+    } else {
+        base_prompt
     };
     struct SpFileGuard(Option<std::path::PathBuf>);
     impl Drop for SpFileGuard {
