@@ -4073,6 +4073,10 @@ async fn handle_clear_command(
             session.history.clear();
             session.pending_uploads.clear();
         }
+        // Also drop any pending plan / plan-related transient state so /clear
+        // leaves no unapproved plan hanging around.
+        data.pending_plans.remove(&chat_id);
+        data.force_disable_plan_next.remove(&chat_id);
         let mdl = get_model(&data.settings, chat_id);
         let prov = provider_from_model(mdl.as_deref());
         let stop_msg = data.stop_message_ids.remove(&chat_id);
@@ -5255,6 +5259,13 @@ async fn handle_plan_command(
         if arg != "status" {
             data.settings.plan_mode.insert(key, next);
             save_bot_settings(token, &data.settings);
+            // When plan mode is turned OFF, any stored unapproved plan is no longer
+            // meaningful — drop it so the next message does not accidentally inherit
+            // the stale /yes /no footer. Also clear any pending force-disable marker.
+            if !next {
+                data.pending_plans.remove(&chat_id);
+                data.force_disable_plan_next.remove(&chat_id);
+            }
         }
         next
     };

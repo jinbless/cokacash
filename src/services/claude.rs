@@ -912,27 +912,18 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Always write system prompt to file and use --append-system-prompt-file
     // to avoid OS "Argument list too long" (E2BIG) error.
-    let base_prompt: Option<String> = match system_prompt {
+    //
+    // NOTE: Plan mode directives are intentionally NOT injected into the system
+    // prompt here. The system prompt is persisted in the resumed session's memory,
+    // so injecting "You MUST use ExitPlanMode" as a permanent rule confuses Claude
+    // on the follow-up approval call (plan_mode=false) where it sees the past
+    // plan-mode instruction as still authoritative. Instead, plan mode guidance
+    // is attached as a one-turn prefix on the user prompt (see `prompt_to_send`
+    // construction below), so it is recorded as an ephemeral user turn.
+    let effective_prompt: Option<String> = match system_prompt {
         None => Some(default_system_prompt),
         Some("") => None,
         Some(p) => Some(p.to_string()),
-    };
-    // In plan mode, append a directive forcing Claude to always emit plans via the
-    // ExitPlanMode tool. Without this, Claude often responds in plain text
-    // ("please approve..."), which the bot cannot reliably capture.
-    let effective_prompt: Option<String> = if plan_mode {
-        let plan_directive = "\n\nPLAN MODE DIRECTIVE (MUST FOLLOW):\n\
-            - You are operating in plan mode (permission-mode=plan).\n\
-            - You MUST respond by calling the ExitPlanMode tool with your full plan in the `plan` field as markdown.\n\
-            - Do NOT reply with plain text saying 'I will do X' or 'please approve' — the user's bot can only capture plans submitted through ExitPlanMode.\n\
-            - Even for trivial tasks, call ExitPlanMode with a one-line plan.\n\
-            - Do not try to execute Write/Edit/Bash on the user's working directory — permission mode will block them anyway.";
-        match base_prompt {
-            Some(mut p) => { p.push_str(plan_directive); Some(p) }
-            None => Some(plan_directive.trim_start().to_string()),
-        }
-    } else {
-        base_prompt
     };
     struct SpFileGuard(Option<std::path::PathBuf>);
     impl Drop for SpFileGuard {
@@ -1028,11 +1019,33 @@ IMPORTANT: Format your responses using Markdown for better readability:
         }
     }
 
+    // Build the actual prompt bytes we send to Claude. In plan mode we prefix a
+    // one-turn directive to the user message so Claude always emits plans via the
+    // ExitPlanMode tool call. This lives in the "user turn" (not system prompt)
+    // so that the follow-up approval call — which runs with plan_mode=false —
+    // does not inherit the directive as an authoritative rule from session memory.
+    let prompt_to_send: String = if plan_mode {
+        format!(
+            "[PLAN MODE — this single turn only]\n\
+             You are currently operating under --permission-mode plan for THIS request only.\n\
+             You MUST respond by calling the ExitPlanMode tool with your full plan in the `plan` field as markdown.\n\
+             Do NOT reply with plain text saying 'I will do X' or 'please approve' — the bot can only capture plans submitted via ExitPlanMode.\n\
+             Even for trivial tasks, call ExitPlanMode with a one-line plan.\n\
+             Do not try to execute Write/Edit/Bash — permission mode will block them anyway.\n\
+             \n\
+             User request:\n\
+             {}",
+            prompt
+        )
+    } else {
+        prompt.to_string()
+    };
+
     // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
-        debug_log(&format!("Writing prompt to stdin ({} bytes)...", prompt.len()));
+        debug_log(&format!("Writing prompt to stdin ({} bytes, plan_mode={})...", prompt_to_send.len(), plan_mode));
         let write_start = std::time::Instant::now();
-        let write_result = stdin.write_all(prompt.as_bytes());
+        let write_result = stdin.write_all(prompt_to_send.as_bytes());
         debug_log(&format!("stdin.write_all completed in {:?}, result={:?}", write_start.elapsed(), write_result.is_ok()));
         // stdin is dropped here, which closes it - this signals end of input to claude
         debug_log("stdin handle dropped (closed)");
